@@ -22,6 +22,6 @@ model Image {
   id          Int     @id @default(autoincrement())
   authorId    Int
   description String?
-  imageUrl    String
+  imageName   String
   author      User    @relation(fields: [authorId], references: [id])
 }
