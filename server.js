@@ -3,10 +3,12 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
-const { PrismaClient } = require('@prisma/client');
 const multer = require('multer');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const crypto = require('crypto');
+const { PrismaClient } = require('@prisma/client');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner') ;
+
 
 const app = express();
 const prisma = new PrismaClient();
@@ -101,7 +103,7 @@ app.post('/login', checkUserExists, checkPassword, async (req, res) => {
 
     try {
         const token = jwt.sign({ userId: user.id }, process.env.SECRET_KEY, {
-            expiresIn: '1h', 
+            expiresIn: '12h', 
         });
 
         await prisma.user.update({
@@ -118,18 +120,18 @@ app.post('/login', checkUserExists, checkPassword, async (req, res) => {
 });
 
 const validateToken = (req, res, next) => {
-    const token = req.header('x-auth-token'); // Assuming you send the token in a header
+    const token = req.header('x-auth-token');
 
     if (!token) {
         return res.status(401).json({ message: 'Access denied. No token provided.' });
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.SECRET_KEY); // Replace with your secret key
+        const decoded = jwt.verify(token, process.env.SECRET_KEY);
         req.user = decoded;
         next();
-    } catch (ex) {
-        res.status(400).json({ message: 'Invalid token.' });
+    } catch (error) {
+        res.status(511).json({ message: 'Invalid token. Needed authenticate.' });
     }
 }
 
@@ -145,25 +147,80 @@ const randomName = () => {
 app.post('/post', validateToken, upload.single('image'), async (req, res)=>{
     console.log('req.body', req.body)
     console.log('req.file', req.file)
-
-    const userId = req.user.userId
-    const params = {
-        Bucket: process.env.BUCKET_NAME,
-        Key: randomName(),
-        Body: req.file.buffer,
-        ContentType: req.file.mimetype,
-    }
-    const command = new PutObjectCommand(params)
     
-    await s3.send(command)
-    const post = await prisma.image.create({
-        data:{
-            imageName: params.Key,
-            description: req.body.description,
-            authorId: userId
+    try {
+        const userId = req.user.userId
+        const params = {
+            Bucket: process.env.BUCKET_NAME,
+            Key: randomName(),
+            Body: req.file.buffer,
+            ContentType: req.file.mimetype,
         }
-    })
-    res.send(post)
+        const command = new PutObjectCommand(params)
+
+        await s3.send(command)
+        const post = await prisma.image.create({
+            data: {
+                imageName: params.Key,
+                description: req.body.description,
+                authorId: userId
+            }
+        })
+        res.status(201).json({ message: 'Created', post });  
+    } catch (error) {
+        res.status(500).json({ message: 'Internal server error' });   
+    }  
+})
+
+app.get('/gallery', validateToken, async (req, res) =>{
+    try {
+        const userId = req.user.userId
+        const posts = await prisma.Image.findMany({
+            where: {
+                authorId: userId,
+            },
+        });
+        for (const post of posts) {
+            const params = {
+                Bucket: process.env.BUCKET_NAME,
+                Key: post.imageName,
+            }
+            const command = new GetObjectCommand(params);
+            const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
+            post.imageUrl = url
+        }
+        console.log('Get gallery')
+        res.status(200).json({message: 'ok', posts})  
+    } catch (error) {
+        res.status(500).json({ message: 'Internal server error' });
+    }
+    
+})
+
+app.delete('/gallery/:id', async (req,res)=>{
+    const id = +req.params.id
+    try {
+        const post = await prisma.Image.findUnique({ where: {id} })
+        if (!post) {
+            res.status(404).send('Post not found')
+            return
+        }
+        console.log(post.imageName)
+
+        const params = {
+            Bucket: process.env.BUCKET_NAME,
+            Key: post.imageName
+        }
+        const command = new DeleteObjectCommand(params)
+        await s3.send(command);
+
+        await prisma.Image.delete({where: {id} })
+
+        res.status(200).send('Deleted')    
+    } catch (error) {
+        res.status(500).json({ message: 'Internal server error' });
+    }
+    
 })
 
 
